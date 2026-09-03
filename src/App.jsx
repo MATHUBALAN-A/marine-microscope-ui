@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Activity, Camera, Clock, HelpCircle,
+  Activity, Camera, Clock,
   LayoutDashboard, Menu, Play, Plus, ExternalLink,
   Download, RefreshCw, Eye, UploadCloud, Image as ImageIcon,
   Thermometer
@@ -9,18 +9,39 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import './App.css';
 
-const PI_IP = '10.237.110.135'; 
-const API_BASE_URL = `http://${PI_IP}:5000`;
+// Edge Device (Raspberry Pi 5) - Strictly used for Stream and Processing Trigger
+const PI_IP = '10.139.235.135'; 
+const PI_STREAM_URL = `http://${PI_IP}:5000/api/stream`;
+const PI_TRIGGER_URL = `http://${PI_IP}:5000/api/trigger`;
+const PI_CAPTURE_URL = `http://${PI_IP}:5000/api/capture`;
+
+// Cloud Attributes (Proxied through Vite to prevent CORS blocks)
+const CLOUD_ATTRIBUTES_URL = `/tb-api/attributes?clientKeys=latestAnalysis,analysisHistory,camera_connected,pi_temperature`;
+
+// Helper function to fetch remote Dropbox image and convert it into Base64 for jsPDF
+const getBase64FromUrl = async (url) => {
+  try {
+    const response = await fetch(url);
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  } catch (err) {
+    console.warn("Could not convert image to base64:", err);
+    return null;
+  }
+};
 
 export default function App() {
   const [currentView, setCurrentView] = useState('dashboard');
   const [analysisMode, setAnalysisMode] = useState('camera'); // 'camera' | 'upload'
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [connectionState, setConnectionState] = useState({
-    status: 'disconnected',
-    cameraConnected: false,
-    modelLoaded: false,
-    mode: 'Offline',
+    status: 'connected',
+    cameraConnected: true,
     temperature: null
   });
 
@@ -34,101 +55,96 @@ export default function App() {
   const [historyList, setHistoryList] = useState([]);
 
   const [latestResult, setLatestResult] = useState({
-    sampleId: 'SMPL_TEST_2026_001',
-    timestamp: '2026-09-01 14:30:00',
-    totalOrganisms: 14,
-    speciesRichness: 4,
-    avgConfidence: 89.5,
-    shannonIndex: 1.34,
-    phytoCount: 9,
-    zooCount: 5,
-    processingTime: '0.42 sec',
-    species: [
-      { name: 'Chaetoceros (Diatom)', count: 6, confidence: 92.4, domain: 'Phytoplankton' },
-      { name: 'Coscinodiscus (Diatom)', count: 3, confidence: 88.1, domain: 'Phytoplankton' },
-      { name: 'Calanoid Copepod', count: 4, confidence: 91.0, domain: 'Zooplankton' },
-      { name: 'Nauplius Larva', count: 1, confidence: 86.5, domain: 'Zooplankton' }
-    ],
-    rawImageBase64: null,
-    annotatedImageBase64: null,
+    sampleId: 'Loading from Cloud...',
+    timestamp: '-',
+    totalOrganisms: 0,
+    speciesRichness: 0,
+    avgConfidence: 0,
+    shannonIndex: 0,
+    phytoCount: 0,
+    zooCount: 0,
+    processingTime: '-',
+    species: [],
     rawImageUrl: '',
     annotatedImageUrl: ''
   });
 
-  // 1. Connection & Hardware Status Poller
-  useEffect(() => {
-    const checkStatus = async () => {
-      try {
-        const res = await fetch(`${API_BASE_URL}/api/status`);
-        if (res.ok) {
-          const data = await res.json();
-          const isSim = data.status === 'simulation_active' || (!data.camera_connected && data.model_loaded);
-          setConnectionState({
-            status: data.camera_connected ? 'connected' : (isSim ? 'simulation' : 'disconnected'),
-            cameraConnected: !!data.camera_connected,
-            modelLoaded: !!(data.model_loaded || data.zoo_model_loaded || data.phyto_model_loaded),
-            mode: data.camera_connected ? 'Live HQ Camera' : 'Simulation Mode',
-            temperature: typeof data.temperature === 'number' ? data.temperature : null
-          });
-        } else {
-          setConnectionState(prev => ({ ...prev, status: 'disconnected', temperature: null }));
-        }
-      } catch {
-        setConnectionState(prev => ({ ...prev, status: 'disconnected', temperature: null }));
-      }
-    };
-
-    checkStatus();
-    const interval = setInterval(checkStatus, 3000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // 2. Fetch History
-  const fetchHistory = async () => {
+  // --------------------------------------------------------------------------
+  // 1. Fetch ALL Data & History Purely from ThingsBoard Cloud
+  // --------------------------------------------------------------------------
+  const fetchThingsBoardCloudData = async () => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/history`);
+      const res = await fetch(CLOUD_ATTRIBUTES_URL);
       if (res.ok) {
         const data = await res.json();
-        setHistoryList(data);
-        if (data.length > 0 && latestResult.sampleId === 'No Analysis Yet') {
-          setLatestResult(data[0]);
+        const clientAttrs = data.client || {};
+
+        if (clientAttrs.pi_temperature !== undefined) {
+          setConnectionState({
+            status: 'connected',
+            cameraConnected: clientAttrs.camera_connected ?? true,
+            temperature: typeof clientAttrs.pi_temperature === 'number' ? clientAttrs.pi_temperature : null
+          });
+        }
+
+        if (clientAttrs.latestAnalysis) {
+          const parsed = typeof clientAttrs.latestAnalysis === 'string'
+            ? JSON.parse(clientAttrs.latestAnalysis)
+            : clientAttrs.latestAnalysis;
+
+          setLatestResult(parsed);
+        }
+
+        // Pull the permanent historical audit trail stored in the Cloud
+        if (clientAttrs.analysisHistory) {
+          const parsedHistory = typeof clientAttrs.analysisHistory === 'string'
+            ? JSON.parse(clientAttrs.analysisHistory)
+            : clientAttrs.analysisHistory;
+
+          if (Array.isArray(parsedHistory)) {
+            setHistoryList(parsedHistory);
+          }
         }
       }
     } catch (e) {
-      console.error("Failed to fetch history:", e);
+      console.warn("ThingsBoard telemetry polling notice:", e);
     }
   };
 
   useEffect(() => {
-    fetchHistory();
-  }, [currentView]);
+    fetchThingsBoardCloudData();
+    const interval = setInterval(fetchThingsBoardCloudData, 3000);
+    return () => clearInterval(interval);
+  }, []);
 
-  // 3. Capture Action (Live Camera)
+  // --------------------------------------------------------------------------
+  // 2. Capture Frame Snapshot (Direct from Pi)
+  // --------------------------------------------------------------------------
   const handleCapture = async () => {
     setIsCapturing(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/capture`, { method: 'POST' });
+      const res = await fetch(PI_CAPTURE_URL, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         setCapturedImage(data.image);
       }
     } catch {
-      alert("Failed to capture image frame.");
+      alert("Failed to capture slide frame from Raspberry Pi.");
     } finally {
       setIsCapturing(false);
     }
   };
 
-  // 4. File Drag & Drop / Upload Handlers
+  // --------------------------------------------------------------------------
+  // 3. File Drag & Drop / Upload Handlers
+  // --------------------------------------------------------------------------
   const handleFileSelect = (file) => {
     if (!file || !file.type.startsWith('image/')) {
-      alert('Please select a valid image file (.jpg, .png, .bmp, etc.)');
+      alert('Please select a valid micrograph image (.jpg, .png, .webp)');
       return;
     }
     const reader = new FileReader();
-    reader.onload = (e) => {
-      setUploadedImage(e.target.result);
-    };
+    reader.onload = (e) => setUploadedImage(e.target.result);
     reader.readAsDataURL(file);
   };
 
@@ -149,38 +165,59 @@ export default function App() {
     }
   };
 
-  // 5. Unified Analyze Action (Handles both Camera capture and Uploaded image)
+  // --------------------------------------------------------------------------
+  // 4. Trigger Analysis on Pi (Zero Local Storage -> Cloud Dispatched)
+  // --------------------------------------------------------------------------
   const handleAnalyze = async () => {
+    if (analysisMode === 'camera' && !capturedImage) {
+      alert("Please capture a slide frame first.");
+      return;
+    }
+    if (analysisMode === 'upload' && !uploadedImage) {
+      alert("Please upload or drop a micrograph image first.");
+      return;
+    }
+
     setIsAnalyzing(true);
     try {
-      let options = { method: 'POST' };
+      let options = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      };
 
       if (analysisMode === 'upload' && uploadedImage) {
-        options.headers = { 'Content-Type': 'application/json' };
         options.body = JSON.stringify({ image: uploadedImage });
+      } else if (analysisMode === 'camera' && capturedImage) {
+        options.body = JSON.stringify({ image: capturedImage });
       }
 
-      const res = await fetch(`${API_BASE_URL}/api/analyse`, options);
+      const res = await fetch(PI_TRIGGER_URL, options);
       if (res.ok) {
-        const data = await res.json();
-        setLatestResult(data);
-        await fetchHistory();
-        setCurrentView('result');
+        // Wait 3.5s for Dropbox upload & ThingsBoard ingestion to settle
+        setTimeout(async () => {
+          await fetchThingsBoardCloudData();
+          setIsAnalyzing(false);
+          setCurrentView('result');
+        }, 3500);
       } else {
         const errData = await res.json().catch(() => ({}));
-        alert(errData.message || "Analysis failed. Verify backend service.");
+        alert(errData.message || "Analysis failed on edge server.");
+        setIsAnalyzing(false);
       }
-    } catch {
-      alert("Analysis failed. Verify backend service connectivity.");
-    } finally {
+    } catch (err) {
+      console.error(err);
+      alert("Cannot reach Raspberry Pi. Check local network connectivity.");
       setIsAnalyzing(false);
     }
   };
 
-  // 6. Automated PDF Report Generation
-  const handleExportReport = () => {
+  // --------------------------------------------------------------------------
+  // 5. Automated PDF Report Generation (Embedded Micrograph Image + Auto-Page)
+  // --------------------------------------------------------------------------
+  const handleExportReport = async () => {
     const doc = new jsPDF();
 
+    // Top Header Banner
     doc.setFillColor(15, 76, 129);
     doc.rect(0, 0, 210, 24, 'F');
     doc.setTextColor(255, 255, 255);
@@ -188,6 +225,7 @@ export default function App() {
     doc.setFont('helvetica', 'bold');
     doc.text('MARINEAI LAB - ECOLOGICAL AUDIT REPORT', 14, 16);
 
+    // Metadata
     doc.setTextColor(30, 41, 59);
     doc.setFontSize(10);
     doc.setFont('helvetica', 'bold');
@@ -195,38 +233,37 @@ export default function App() {
     doc.setFont('helvetica', 'normal');
     doc.text(`Timestamp: ${latestResult.timestamp || new Date().toLocaleString()}`, 14, 40);
 
+    // Key Metrics Table
     autoTable(doc, {
-      startY: 58,
+      startY: 46,
       head: [['Metric', 'Value', 'Ecological Status']],
       body: [
         ['Total Detected Organisms', `${latestResult.totalOrganisms}`, 'Verified'],
         ['Species Richness', `${latestResult.speciesRichness}`, `${latestResult.speciesRichness > 3 ? 'High Diversity' : 'Low Richness'}`],
         ['Shannon Biodiversity Index (H\')', `${latestResult.shannonIndex}`, `${latestResult.shannonIndex >= 1.5 ? 'Balanced Ecosystem' : 'Stressed Environment'}`],
         ['Average Confidence', `${latestResult.avgConfidence}%`, 'Optimal Detection'],
-        ['Inference & Slice Time', `${latestResult.processingTime}`, 'Edge Accelerated']
+        ['Inference & Slicing Time', `${latestResult.processingTime}`, 'Edge OpenVINO Accelerated']
       ],
       theme: 'grid',
       headStyles: { fillColor: [15, 76, 129], textColor: [255, 255, 255], fontStyle: 'bold' },
       styles: { fontSize: 9 }
     });
 
-    const tableData = (latestResult.species || []).map(sp => {
-      const isPhyto = sp.domain === 'Phytoplankton' || (sp.name && sp.name.toLowerCase().includes('phyto'));
-      return [
-        isPhyto ? 'Phytoplankton' : 'Zooplankton',
-        sp.name,
-        sp.count,
-        `${sp.confidence}%`
-      ];
-    });
+    // Taxonomic Breakdown Table
+    const tableData = (latestResult.species || []).map(sp => [
+      sp.domain || 'Microorganism',
+      sp.name,
+      sp.count,
+      `${sp.confidence}%`
+    ]);
 
-    const finalY = doc.lastAutoTable.finalY || 110;
+    const finalY = doc.lastAutoTable.finalY || 100;
     doc.setFontSize(11);
     doc.setFont('helvetica', 'bold');
-    doc.text('Taxonomic Breakdown', 14, finalY + 10);
+    doc.text('Taxonomic Breakdown', 14, finalY + 8);
 
     autoTable(doc, {
-      startY: finalY + 14,
+      startY: finalY + 12,
       head: [['Domain', 'Species / Taxon Name', 'Count', 'Confidence']],
       body: tableData.length > 0 ? tableData : [['-', 'No organisms detected in slide frame', '0', '-']],
       theme: 'striped',
@@ -234,24 +271,55 @@ export default function App() {
       styles: { fontSize: 9 }
     });
 
-    const imgData = latestResult.annotatedImageBase64 || latestResult.rawImageBase64;
-    let nextY = doc.lastAutoTable.finalY + 10;
+    let currentY = doc.lastAutoTable.finalY + 8;
 
-    if (imgData && nextY < 210) {
+    // Embed Actual Micrograph Image into the PDF
+    const imgUrl = latestResult.annotatedImageUrl || latestResult.rawImageUrl;
+    if (imgUrl) {
+      if (currentY > 190) {
+        doc.addPage();
+        currentY = 20;
+      }
+
       doc.setFontSize(11);
       doc.setFont('helvetica', 'bold');
-      doc.text('Annotated Micrograph', 14, nextY);
-      doc.addImage(imgData, 'JPEG', 14, nextY + 4, 80, 60);
-      nextY += 70;
+      doc.setTextColor(15, 76, 129);
+      doc.text('Annotated Micrograph (Detection Layer)', 14, currentY);
+
+      try {
+        const base64Img = await getBase64FromUrl(imgUrl);
+        if (base64Img) {
+          doc.addImage(base64Img, 'JPEG', 14, currentY + 4, 130, 73.1);
+          currentY += 82;
+        }
+      } catch (err) {
+        console.error("Failed to render image in PDF:", err);
+      }
     }
 
+    // Direct Cloud Hyperlink fallback
+    if (latestResult.annotatedImageUrl) {
+      doc.setFontSize(9);
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(15, 76, 129);
+      doc.textWithLink(
+        '--> Open Full-Resolution Image on Dropbox',
+        14,
+        currentY + 4,
+        { url: latestResult.annotatedImageUrl }
+      );
+    }
+
+    // Footer note
     doc.setFontSize(8);
     doc.setFont('helvetica', 'italic');
     doc.setTextColor(100, 116, 139);
-    doc.text('Generated automatically by MarineAI Edge Computing System', 14, 285);
+    doc.text('Generated automatically by MarineAI Edge Computing System (ThingsBoard & Dropbox Synced)', 14, 285);
 
     doc.save(`MarineAI_Report_${latestResult.sampleId.replace(/\s+/g, '_')}.pdf`);
   };
+
+  const canRunAnalysis = analysisMode === 'camera' ? !!capturedImage : !!uploadedImage;
 
   return (
     <div className="app-container">
@@ -268,7 +336,6 @@ export default function App() {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          {/* Pi Thermal Sensor Telemetry */}
           {connectionState.temperature !== null && (
             <span className={`temp-badge ${
               connectionState.temperature > 75 ? 'hot' : (connectionState.temperature > 60 ? 'warm' : 'normal')
@@ -278,11 +345,9 @@ export default function App() {
             </span>
           )}
 
-          <span className={`status-badge ${connectionState.status}`}>
+          <span className="status-badge connected">
             <span className="status-dot"></span>
-            {connectionState.status === 'connected' && "Live HQ Sensor"}
-            {connectionState.status === 'simulation' && "Simulation Active"}
-            {connectionState.status === 'disconnected' && "Offline"}
+            Cloud Synced (ThingsBoard)
           </span>
         </div>
       </header>
@@ -304,7 +369,7 @@ export default function App() {
         </aside>
       )}
 
-      {/* MAIN CONTENT */}
+      {/* MAIN VIEWPORT */}
       <main className="main-content">
 
         {/* 1. DASHBOARD OVERVIEW */}
@@ -312,7 +377,7 @@ export default function App() {
           <div>
             <div className="page-title-section">
               <div>
-                <div className="eyebrow">Laboratory Workspace</div>
+                <div className="eyebrow">Cloud Workspace (ThingsBoard)</div>
                 <h1 className="page-title">Ecological & Specimen Overview</h1>
               </div>
               <button className="btn-primary" onClick={() => setCurrentView('analysis')}>
@@ -341,7 +406,7 @@ export default function App() {
 
             <div className="card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '16px' }}>
               <div>
-                <div className="eyebrow">Most Recent Sample</div>
+                <div className="eyebrow">Latest Sample from ThingsBoard</div>
                 <div style={{ fontWeight: 700, fontSize: '16px' }}>{latestResult.sampleId}</div>
                 <div style={{ fontSize: '12px', color: '#64748b' }}>
                   {latestResult.totalOrganisms > 0 
@@ -358,28 +423,27 @@ export default function App() {
           </div>
         )}
 
-        {/* 2. CAPTURE & INGESTION (LIVE CAMERA OR DRAG-AND-DROP UPLOAD) */}
+        {/* 2. CAPTURE & INGESTION */}
         {currentView === 'analysis' && (
           <div>
             <div className="page-title-section">
               <div>
-                <div className="eyebrow">Microscopy Ingestion</div>
+                <div className="eyebrow">Edge Acquisition & Cloud Slicing</div>
                 <h1 className="page-title">Specimen Ingestion & Analysis</h1>
               </div>
 
-              {/* Mode Toggle Bar */}
               <div className="tab-pill-group">
                 <button 
                   className={`tab-pill ${analysisMode === 'camera' ? 'active' : ''}`}
                   onClick={() => setAnalysisMode('camera')}
                 >
-                  <Camera size={15} /> Live HQ Camera
+                  <Camera size={15} /> Live HQ Camera (Pi)
                 </button>
                 <button 
                   className={`tab-pill ${analysisMode === 'upload' ? 'active' : ''}`}
                   onClick={() => setAnalysisMode('upload')}
                 >
-                  <UploadCloud size={15} /> Upload Image File
+                  <UploadCloud size={15} /> Upload Micrograph File
                 </button>
               </div>
             </div>
@@ -389,24 +453,27 @@ export default function App() {
               <div className="card">
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px' }}>
                   <span style={{ fontWeight: 600, fontSize: '14px' }}>
-                    {analysisMode === 'camera' ? 'Optical Field View' : 'Local Specimen Image'}
+                    {analysisMode === 'camera' ? 'Optical Field View (Pi Stream)' : 'Local Micrograph File'}
                   </span>
-                  <span style={{ fontSize: '12px', fontWeight: 600, color: analysisMode === 'camera' ? (connectionState.status === 'connected' ? '#137333' : '#b45309') : '#0f4c81' }}>
-                    • {analysisMode === 'camera' ? connectionState.mode : 'File Ingestion Mode'}
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: '#0f4c81' }}>
+                    • {analysisMode === 'camera' ? (capturedImage ? 'Frame Captured (Ready)' : 'Live IMX477 Optical Feed') : (uploadedImage ? 'File Staged (Ready)' : 'Awaiting File')}
                   </span>
                 </div>
                 
                 {analysisMode === 'camera' ? (
                   <div className="preview-box">
                     {capturedImage ? (
-                      <img src={capturedImage} alt="Captured Slide" className="preview-overlay-image" />
-                    ) : connectionState.status !== 'disconnected' ? (
-                      <img src={`${API_BASE_URL}/api/stream`} alt="Live Camera Feed" className="preview-overlay-image" />
-                    ) : (
-                      <div style={{ textAlign: 'center', color: '#64748b' }}>
-                        <Camera size={40} style={{ marginBottom: '8px', opacity: 0.5 }} />
-                        <div>Connect Raspberry Pi server to activate optical feed</div>
+                      <div className="uploaded-preview-wrapper" style={{ width: '100%', height: '100%' }}>
+                        <img src={capturedImage} alt="Captured Slide" className="preview-overlay-image" />
+                        <button 
+                          className="dropzone-reset-btn"
+                          onClick={() => setCapturedImage(null)}
+                        >
+                          <RefreshCw size={14} /> Recapture Live Feed
+                        </button>
                       </div>
+                    ) : (
+                      <img src={PI_STREAM_URL} alt="Live Camera Feed" className="preview-overlay-image" />
                     )}
                   </div>
                 ) : (
@@ -463,8 +530,8 @@ export default function App() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '12px', fontSize: '12px', color: '#64748b' }}>
                   <span>
                     {analysisMode === 'camera' 
-                      ? `Sensor: ${connectionState.status === 'connected' ? "Arducam IMX477 HQ" : "Simulated Slide Feed"}`
-                      : "Source: User File Upload"}
+                      ? "Sensor: Arducam IMX477 HQ (1080p @ 25 FPS)"
+                      : "Source: High-Resolution File Ingestion"}
                   </span>
                   <span>Magnification: 100× Industrial Objective</span>
                 </div>
@@ -479,17 +546,17 @@ export default function App() {
                   
                   {analysisMode === 'camera' ? (
                     <ul className="checklist">
-                      <li><span className="step-num">1</span> Mount water specimen slide.</li>
-                      <li><span className="step-num">2</span> Focus microscope lighting.</li>
-                      <li><span className="step-num">3</span> Click <b>Capture Slide Frame</b>.</li>
-                      <li><span className="step-num">4</span> Run <b>Run Analysis</b>.</li>
+                      <li><span className="step-num">1</span> Mount water specimen slide & focus lighting.</li>
+                      <li><span className="step-num">2</span> Click <b>Capture Slide Frame</b> to freeze.</li>
+                      <li><span className="step-num">3</span> <b>Run Analysis</b> button unlocks once captured.</li>
+                      <li><span className="step-num">4</span> All data & images synced directly to Cloud.</li>
                     </ul>
                   ) : (
                     <ul className="checklist">
-                      <li><span className="step-num">1</span> Drag & drop or browse for an existing image.</li>
+                      <li><span className="step-num">1</span> Drag & drop or browse for a micrograph file.</li>
                       <li><span className="step-num">2</span> Inspect file preview thumbnail.</li>
-                      <li><span className="step-num">3</span> Click <b>Run Analysis (Uploaded File)</b>.</li>
-                      <li><span className="step-num">4</span> Review taxonomic detection output.</li>
+                      <li><span className="step-num">3</span> <b>Run Analysis</b> button unlocks once staged.</li>
+                      <li><span className="step-num">4</span> Results archived purely in Cloud (ThingsBoard & Dropbox).</li>
                     </ul>
                   )}
                 </div>
@@ -501,58 +568,57 @@ export default function App() {
                         className="btn-primary" 
                         style={{ justifyContent: 'center' }} 
                         onClick={handleCapture} 
-                        disabled={isCapturing || connectionState.status === 'disconnected'}
+                        disabled={isCapturing}
                       >
-                        <Camera size={16} /> {isCapturing ? "Capturing..." : "Capture Slide Frame"}
+                        <Camera size={16} /> {isCapturing ? "Capturing..." : (capturedImage ? "Recapture Slide Frame" : "Capture Slide Frame")}
                       </button>
                       
                       <button 
-                        className="btn-secondary" 
+                        className={canRunAnalysis ? "btn-primary" : "btn-secondary"} 
                         style={{ 
                           display: 'flex', 
                           justifyContent: 'center', 
                           gap: '8px', 
-                          background: capturedImage ? '#0f4c81' : '', 
-                          color: capturedImage ? '#fff' : '' 
+                          background: canRunAnalysis ? '#0f4c81' : '#f1f5f9', 
+                          color: canRunAnalysis ? '#fff' : '#94a3b8',
+                          cursor: canRunAnalysis ? 'pointer' : 'not-allowed',
+                          border: canRunAnalysis ? 'none' : '1px solid #e2e8f0'
                         }} 
                         onClick={handleAnalyze} 
-                        disabled={!capturedImage || isAnalyzing}
+                        disabled={!canRunAnalysis || isAnalyzing}
                       >
-                        <Play size={16} /> {isAnalyzing ? "Analyzing (OpenVINO)..." : "Run Analysis"}
+                        <Play size={16} /> {isAnalyzing ? "Processing & Syncing to Cloud..." : "Run Analysis & Sync to Cloud"}
                       </button>
 
-                      {capturedImage && (
-                        <button 
-                          className="btn-secondary" 
-                          style={{ border: 'none', background: 'none', color: '#64748b', justifyContent: 'center' }} 
-                          onClick={() => setCapturedImage(null)}
-                        >
-                          <RefreshCw size={14} /> Clear Frame & Return to Live Feed
-                        </button>
+                      {!capturedImage && (
+                        <div style={{ fontSize: '11px', color: '#94a3b8', textAlign: 'center' }}>
+                          Capture a frame first to unlock AI analysis
+                        </div>
                       )}
                     </>
                   ) : (
                     <>
                       <button 
-                        className="btn-primary" 
-                        style={{ justifyContent: 'center' }} 
+                        className={canRunAnalysis ? "btn-primary" : "btn-secondary"} 
+                        style={{ 
+                          justifyContent: 'center',
+                          display: 'flex',
+                          gap: '8px',
+                          background: canRunAnalysis ? '#0f4c81' : '#f1f5f9',
+                          color: canRunAnalysis ? '#fff' : '#94a3b8',
+                          cursor: canRunAnalysis ? 'pointer' : 'not-allowed',
+                          border: canRunAnalysis ? 'none' : '1px solid #e2e8f0'
+                        }} 
                         onClick={handleAnalyze} 
-                        disabled={!uploadedImage || isAnalyzing}
+                        disabled={!canRunAnalysis || isAnalyzing}
                       >
-                        <Play size={16} /> {isAnalyzing ? "Analyzing Image..." : "Run Analysis (Uploaded File)"}
+                        <Play size={16} /> {isAnalyzing ? "Processing & Syncing to Cloud..." : "Run Analysis (Uploaded File)"}
                       </button>
 
-                      {uploadedImage && (
-                        <button 
-                          className="btn-secondary" 
-                          style={{ border: 'none', background: 'none', color: '#64748b', justifyContent: 'center' }} 
-                          onClick={() => {
-                            setUploadedImage(null);
-                            if (fileInputRef.current) fileInputRef.current.value = '';
-                          }}
-                        >
-                          <RefreshCw size={14} /> Clear Uploaded Image
-                        </button>
+                      {!uploadedImage && (
+                        <div style={{ fontSize: '11px', color: '#94a3b8', textAlign: 'center' }}>
+                          Upload an image first to unlock AI analysis
+                        </div>
                       )}
                     </>
                   )}
@@ -567,7 +633,7 @@ export default function App() {
           <div>
             <div className="page-title-section">
               <div>
-                <div className="eyebrow">Analysis Report</div>
+                <div className="eyebrow">Analysis Report (ThingsBoard & Dropbox Synced)</div>
                 <h1 className="page-title">Taxonomic Breakdown ({latestResult.sampleId})</h1>
               </div>
               <button className="btn-secondary" onClick={handleExportReport}>
@@ -578,30 +644,30 @@ export default function App() {
             <div className="capture-layout" style={{ marginBottom: '24px' }}>
               <div className="card" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                 <div>
-                  <div className="card-title">Original Micrograph</div>
+                  <div className="card-title">Original Micrograph (Dropbox)</div>
                   <div className="preview-box" style={{ height: '280px' }}>
-                    {latestResult.rawImageBase64 || latestResult.rawImageUrl ? (
-                      <img src={latestResult.rawImageBase64 || latestResult.rawImageUrl} alt="Original Raw" className="preview-overlay-image" />
+                    {latestResult.rawImageUrl ? (
+                      <img src={latestResult.rawImageUrl} alt="Original Raw" className="preview-overlay-image" />
                     ) : (
-                      <div style={{ fontSize: '12px', color: '#64748b' }}>No image loaded</div>
+                      <div style={{ fontSize: '12px', color: '#64748b' }}>Awaiting cloud image...</div>
                     )}
                   </div>
                 </div>
 
                 <div>
-                  <div className="card-title">AI Detection Layer (Dual-Model)</div>
+                  <div className="card-title">AI Detection Layer (Dropbox)</div>
                   <div className="preview-box" style={{ height: '280px', border: '2px solid #0f4c81' }}>
-                    {latestResult.annotatedImageBase64 || latestResult.annotatedImageUrl ? (
-                      <img src={latestResult.annotatedImageBase64 || latestResult.annotatedImageUrl} alt="AI Detected" className="preview-overlay-image" />
+                    {latestResult.annotatedImageUrl ? (
+                      <img src={latestResult.annotatedImageUrl} alt="AI Detected" className="preview-overlay-image" />
                     ) : (
-                      <div style={{ fontSize: '12px', color: '#64748b' }}>No detections loaded</div>
+                      <div style={{ fontSize: '12px', color: '#64748b' }}>Awaiting cloud image...</div>
                     )}
                   </div>
                 </div>
               </div>
 
               <div className="card">
-                <h3 style={{ fontSize: '15px', fontWeight: 700, marginBottom: '12px' }}>Species Distribution</h3>
+                <h3 style={{ fontSize: '15px', fontWeight: 700, marginBottom: '12px' }}>Species Distribution (From ThingsBoard)</h3>
                 {latestResult.species && latestResult.species.length > 0 ? (
                   <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
                     <thead>
@@ -658,13 +724,13 @@ export default function App() {
           </div>
         )}
 
-        {/* 4. HISTORY ARCHIVE */}
+        {/* 4. PERMANENT CLOUD HISTORY ARCHIVE */}
         {currentView === 'history' && (
           <div>
             <div className="page-title-section">
               <div>
-                <div className="eyebrow">Analysis Archive</div>
-                <h1 className="page-title">Sample History & Telemetry</h1>
+                <div className="eyebrow">Cloud Archive (ThingsBoard Database)</div>
+                <h1 className="page-title">Sample History & Audit Trail</h1>
               </div>
               <button className="btn-primary" onClick={() => setCurrentView('analysis')}>
                 <Plus size={16} /> New analysis
@@ -679,7 +745,7 @@ export default function App() {
                   <th>TIMESTAMP</th>
                   <th>TOTAL COUNT</th>
                   <th>SHANNON (H')</th>
-                  <th>STORAGE</th>
+                  <th>CLOUD ARCHIVE</th>
                   <th>ACTIONS</th>
                 </tr>
               </thead>
@@ -690,9 +756,10 @@ export default function App() {
                       <td style={{ padding: '8px' }}>
                         <div style={{ width: '64px', height: '48px', borderRadius: '4px', overflow: 'hidden', background: '#090d16' }}>
                           <img 
-                            src={item.annotatedImageBase64 || item.annotatedImageUrl || item.rawImageBase64} 
+                            src={item.annotatedImageUrl || item.rawImageUrl} 
                             alt="Preview" 
                             style={{ width: '100%', height: '100%', objectFit: 'cover' }} 
+                            onError={(e) => { e.target.style.display = 'none'; }}
                           />
                         </div>
                       </td>
@@ -701,12 +768,12 @@ export default function App() {
                       <td>{item.totalOrganisms}</td>
                       <td><b>{item.shannonIndex}</b></td>
                       <td>
-                        {item.rawImageUrl ? (
-                          <a href={item.rawImageUrl} target="_blank" rel="noreferrer" style={{ color: '#0f4c81', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '12px' }}>
-                            Cloud Archive <ExternalLink size={12} />
+                        {item.annotatedImageUrl ? (
+                          <a href={item.annotatedImageUrl} target="_blank" rel="noreferrer" style={{ color: '#0f4c81', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '12px' }}>
+                            Dropbox Link <ExternalLink size={12} />
                           </a>
                         ) : (
-                          <span style={{ color: '#94a3b8', fontSize: '12px' }}>Local RAM</span>
+                          <span style={{ color: '#94a3b8', fontSize: '12px' }}>Processing</span>
                         )}
                       </td>
                       <td>
@@ -723,7 +790,7 @@ export default function App() {
                 ) : (
                   <tr>
                     <td colSpan={7} style={{ textAlign: 'center', color: '#64748b', padding: '24px' }}>
-                      No archived analysis records found.
+                      No archived analysis records found in ThingsBoard Cloud.
                     </td>
                   </tr>
                 )}
