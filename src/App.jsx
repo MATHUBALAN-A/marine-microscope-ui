@@ -1,31 +1,36 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Activity, Camera, Clock, HelpCircle,
   LayoutDashboard, Menu, Play, Plus, ExternalLink,
-  Download, RefreshCw, Eye
+  Download, RefreshCw, Eye, UploadCloud, Image as ImageIcon,
+  Thermometer
 } from 'lucide-react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import './App.css';
 
-const PI_IP = '10.138.130.135'; 
+const PI_IP = '10.237.110.135'; 
 const API_BASE_URL = `http://${PI_IP}:5000`;
 
 export default function App() {
   const [currentView, setCurrentView] = useState('dashboard');
+  const [analysisMode, setAnalysisMode] = useState('camera'); // 'camera' | 'upload'
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [connectionState, setConnectionState] = useState({
     status: 'disconnected',
     cameraConnected: false,
     modelLoaded: false,
-    mode: 'Offline'
+    mode: 'Offline',
+    temperature: null
   });
 
   const [capturedImage, setCapturedImage] = useState(null);
+  const [uploadedImage, setUploadedImage] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  // Restored missing state definition
+  const fileInputRef = useRef(null);
   const [historyList, setHistoryList] = useState([]);
 
   const [latestResult, setLatestResult] = useState({
@@ -50,7 +55,7 @@ export default function App() {
     annotatedImageUrl: ''
   });
 
-  // 1. Connection Poller
+  // 1. Connection & Hardware Status Poller
   useEffect(() => {
     const checkStatus = async () => {
       try {
@@ -61,14 +66,15 @@ export default function App() {
           setConnectionState({
             status: data.camera_connected ? 'connected' : (isSim ? 'simulation' : 'disconnected'),
             cameraConnected: !!data.camera_connected,
-            modelLoaded: !!data.model_loaded,
-            mode: data.camera_connected ? 'Live HQ Camera' : 'Simulation Mode'
+            modelLoaded: !!(data.model_loaded || data.zoo_model_loaded || data.phyto_model_loaded),
+            mode: data.camera_connected ? 'Live HQ Camera' : 'Simulation Mode',
+            temperature: typeof data.temperature === 'number' ? data.temperature : null
           });
         } else {
-          setConnectionState(prev => ({ ...prev, status: 'disconnected' }));
+          setConnectionState(prev => ({ ...prev, status: 'disconnected', temperature: null }));
         }
       } catch {
-        setConnectionState(prev => ({ ...prev, status: 'disconnected' }));
+        setConnectionState(prev => ({ ...prev, status: 'disconnected', temperature: null }));
       }
     };
 
@@ -97,7 +103,7 @@ export default function App() {
     fetchHistory();
   }, [currentView]);
 
-  // 3. Capture Action
+  // 3. Capture Action (Live Camera)
   const handleCapture = async () => {
     setIsCapturing(true);
     try {
@@ -113,29 +119,68 @@ export default function App() {
     }
   };
 
-  // 4. Analyze Action
+  // 4. File Drag & Drop / Upload Handlers
+  const handleFileSelect = (file) => {
+    if (!file || !file.type.startsWith('image/')) {
+      alert('Please select a valid image file (.jpg, .png, .bmp, etc.)');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setUploadedImage(e.target.result);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleFileSelect(e.dataTransfer.files[0]);
+    }
+  };
+
+  // 5. Unified Analyze Action (Handles both Camera capture and Uploaded image)
   const handleAnalyze = async () => {
     setIsAnalyzing(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/analyse`, { method: 'POST' });
+      let options = { method: 'POST' };
+
+      if (analysisMode === 'upload' && uploadedImage) {
+        options.headers = { 'Content-Type': 'application/json' };
+        options.body = JSON.stringify({ image: uploadedImage });
+      }
+
+      const res = await fetch(`${API_BASE_URL}/api/analyse`, options);
       if (res.ok) {
         const data = await res.json();
         setLatestResult(data);
         await fetchHistory();
         setCurrentView('result');
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        alert(errData.message || "Analysis failed. Verify backend service.");
       }
     } catch {
-      alert("Analysis failed. Verify backend service.");
+      alert("Analysis failed. Verify backend service connectivity.");
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  // 5. Automated PDF Report Generation
+  // 6. Automated PDF Report Generation
   const handleExportReport = () => {
     const doc = new jsPDF();
 
-    // Document Header & Styling
     doc.setFillColor(15, 76, 129);
     doc.rect(0, 0, 210, 24, 'F');
     doc.setTextColor(255, 255, 255);
@@ -143,7 +188,6 @@ export default function App() {
     doc.setFont('helvetica', 'bold');
     doc.text('MARINEAI LAB - ECOLOGICAL AUDIT REPORT', 14, 16);
 
-    // Metadata Section
     doc.setTextColor(30, 41, 59);
     doc.setFontSize(10);
     doc.setFont('helvetica', 'bold');
@@ -151,7 +195,6 @@ export default function App() {
     doc.setFont('helvetica', 'normal');
     doc.text(`Timestamp: ${latestResult.timestamp || new Date().toLocaleString()}`, 14, 40);
 
-    // Summary Metric Cards (Table)
     autoTable(doc, {
       startY: 58,
       head: [['Metric', 'Value', 'Ecological Status']],
@@ -160,14 +203,13 @@ export default function App() {
         ['Species Richness', `${latestResult.speciesRichness}`, `${latestResult.speciesRichness > 3 ? 'High Diversity' : 'Low Richness'}`],
         ['Shannon Biodiversity Index (H\')', `${latestResult.shannonIndex}`, `${latestResult.shannonIndex >= 1.5 ? 'Balanced Ecosystem' : 'Stressed Environment'}`],
         ['Average Confidence', `${latestResult.avgConfidence}%`, 'Optimal Detection'],
-        ['Inference & Scan Latency', `${latestResult.processingTime}`, 'Edge Accelerated']
+        ['Inference & Slice Time', `${latestResult.processingTime}`, 'Edge Accelerated']
       ],
       theme: 'grid',
       headStyles: { fillColor: [15, 76, 129], textColor: [255, 255, 255], fontStyle: 'bold' },
       styles: { fontSize: 9 }
     });
 
-    // Species Distribution Breakdown Table
     const tableData = (latestResult.species || []).map(sp => {
       const isPhyto = sp.domain === 'Phytoplankton' || (sp.name && sp.name.toLowerCase().includes('phyto'));
       return [
@@ -192,7 +234,6 @@ export default function App() {
       styles: { fontSize: 9 }
     });
 
-    // Micrograph Image Embed (if base64 exists)
     const imgData = latestResult.annotatedImageBase64 || latestResult.rawImageBase64;
     let nextY = doc.lastAutoTable.finalY + 10;
 
@@ -204,13 +245,11 @@ export default function App() {
       nextY += 70;
     }
 
-    // Sign-off Footer
     doc.setFontSize(8);
     doc.setFont('helvetica', 'italic');
     doc.setTextColor(100, 116, 139);
     doc.text('Generated automatically by MarineAI Edge Computing System', 14, 285);
 
-    // Trigger Browser Download
     doc.save(`MarineAI_Report_${latestResult.sampleId.replace(/\s+/g, '_')}.pdf`);
   };
 
@@ -228,7 +267,17 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          {/* Pi Thermal Sensor Telemetry */}
+          {connectionState.temperature !== null && (
+            <span className={`temp-badge ${
+              connectionState.temperature > 75 ? 'hot' : (connectionState.temperature > 60 ? 'warm' : 'normal')
+            }`}>
+              <Thermometer size={14} />
+              <span>{connectionState.temperature}°C</span>
+            </span>
+          )}
+
           <span className={`status-badge ${connectionState.status}`}>
             <span className="status-dot"></span>
             {connectionState.status === 'connected' && "Live HQ Sensor"}
@@ -309,69 +358,203 @@ export default function App() {
           </div>
         )}
 
-        {/* 2. CAPTURE & LIVE PREVIEW */}
+        {/* 2. CAPTURE & INGESTION (LIVE CAMERA OR DRAG-AND-DROP UPLOAD) */}
         {currentView === 'analysis' && (
           <div>
             <div className="page-title-section">
               <div>
                 <div className="eyebrow">Microscopy Ingestion</div>
-                <h1 className="page-title">Live Slide Capture</h1>
+                <h1 className="page-title">Specimen Ingestion & Analysis</h1>
+              </div>
+
+              {/* Mode Toggle Bar */}
+              <div className="tab-pill-group">
+                <button 
+                  className={`tab-pill ${analysisMode === 'camera' ? 'active' : ''}`}
+                  onClick={() => setAnalysisMode('camera')}
+                >
+                  <Camera size={15} /> Live HQ Camera
+                </button>
+                <button 
+                  className={`tab-pill ${analysisMode === 'upload' ? 'active' : ''}`}
+                  onClick={() => setAnalysisMode('upload')}
+                >
+                  <UploadCloud size={15} /> Upload Image File
+                </button>
               </div>
             </div>
 
             <div className="capture-layout">
+              {/* Left Column: Visual Viewport */}
               <div className="card">
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px' }}>
-                  <span style={{ fontWeight: 600, fontSize: '14px' }}>Optical Field View</span>
-                  <span style={{ fontSize: '12px', fontWeight: 600, color: connectionState.status === 'connected' ? '#137333' : '#b45309' }}>
-                    • {connectionState.mode}
+                  <span style={{ fontWeight: 600, fontSize: '14px' }}>
+                    {analysisMode === 'camera' ? 'Optical Field View' : 'Local Specimen Image'}
+                  </span>
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: analysisMode === 'camera' ? (connectionState.status === 'connected' ? '#137333' : '#b45309') : '#0f4c81' }}>
+                    • {analysisMode === 'camera' ? connectionState.mode : 'File Ingestion Mode'}
                   </span>
                 </div>
                 
-                <div className="preview-box">
-                  {capturedImage ? (
-                    <img src={capturedImage} alt="Captured Slide" className="preview-overlay-image" />
-                  ) : connectionState.status !== 'disconnected' ? (
-                    <img src={`${API_BASE_URL}/api/stream`} alt="Live Camera Feed" className="preview-overlay-image" />
-                  ) : (
-                    <div style={{ textAlign: 'center', color: '#64748b' }}>
-                      <Camera size={40} style={{ marginBottom: '8px', opacity: 0.5 }} />
-                      <div>Connect Raspberry Pi server to activate optical feed</div>
-                    </div>
-                  )}
-                </div>
+                {analysisMode === 'camera' ? (
+                  <div className="preview-box">
+                    {capturedImage ? (
+                      <img src={capturedImage} alt="Captured Slide" className="preview-overlay-image" />
+                    ) : connectionState.status !== 'disconnected' ? (
+                      <img src={`${API_BASE_URL}/api/stream`} alt="Live Camera Feed" className="preview-overlay-image" />
+                    ) : (
+                      <div style={{ textAlign: 'center', color: '#64748b' }}>
+                        <Camera size={40} style={{ marginBottom: '8px', opacity: 0.5 }} />
+                        <div>Connect Raspberry Pi server to activate optical feed</div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div 
+                    className={`upload-dropzone ${isDragging ? 'dragging' : ''} ${uploadedImage ? 'has-file' : ''}`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    onClick={() => !uploadedImage && fileInputRef.current?.click()}
+                  >
+                    <input 
+                      type="file" 
+                      ref={fileInputRef} 
+                      style={{ display: 'none' }} 
+                      accept="image/*"
+                      onChange={(e) => e.target.files && handleFileSelect(e.target.files[0])}
+                    />
+
+                    {uploadedImage ? (
+                      <div className="uploaded-preview-wrapper">
+                        <img src={uploadedImage} alt="Uploaded Plankton Slide" className="preview-overlay-image" />
+                        <button 
+                          className="dropzone-reset-btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setUploadedImage(null);
+                            if (fileInputRef.current) fileInputRef.current.value = '';
+                          }}
+                        >
+                          <RefreshCw size={14} /> Replace File
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="dropzone-content">
+                        <UploadCloud size={48} color="#0f4c81" style={{ marginBottom: '12px', opacity: 0.8 }} />
+                        <h4 style={{ fontSize: '15px', fontWeight: 700, marginBottom: '6px' }}>
+                          Drag and drop plankton image here
+                        </h4>
+                        <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '14px' }}>
+                          Supports high-resolution JPG, PNG, WEBP micrographs
+                        </p>
+                        <button 
+                          type="button" 
+                          className="btn-secondary" 
+                          style={{ pointerEvents: 'none' }}
+                        >
+                          <ImageIcon size={15} /> Browse Local Storage
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '12px', fontSize: '12px', color: '#64748b' }}>
-                  <span>Sensor: {connectionState.status === 'connected' ? "Arducam IMX477 HQ" : "Simulated Slide Feed"}</span>
+                  <span>
+                    {analysisMode === 'camera' 
+                      ? `Sensor: ${connectionState.status === 'connected' ? "Arducam IMX477 HQ" : "Simulated Slide Feed"}`
+                      : "Source: User File Upload"}
+                  </span>
                   <span>Magnification: 100× Industrial Objective</span>
                 </div>
               </div>
 
+              {/* Right Column: Workflow Controls */}
               <div className="card" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
                 <div>
-                  <h3 style={{ fontSize: '16px', fontWeight: 700 }}>Slide Acquisition Workflow</h3>
+                  <h3 style={{ fontSize: '16px', fontWeight: 700 }}>
+                    {analysisMode === 'camera' ? "Slide Acquisition Workflow" : "File Ingestion Workflow"}
+                  </h3>
                   
-                  <ul className="checklist">
-                    <li><span className="step-num">1</span> Mount water specimen slide.</li>
-                    <li><span className="step-num">2</span> Focus microscope lighting.</li>
-                    <li><span className="step-num">3</span> Click <b>Capture Slide Frame</b>.</li>
-                    <li><span className="step-num">4</span> Run <b>Run Analysis</b>.</li>
-                  </ul>
+                  {analysisMode === 'camera' ? (
+                    <ul className="checklist">
+                      <li><span className="step-num">1</span> Mount water specimen slide.</li>
+                      <li><span className="step-num">2</span> Focus microscope lighting.</li>
+                      <li><span className="step-num">3</span> Click <b>Capture Slide Frame</b>.</li>
+                      <li><span className="step-num">4</span> Run <b>Run Analysis</b>.</li>
+                    </ul>
+                  ) : (
+                    <ul className="checklist">
+                      <li><span className="step-num">1</span> Drag & drop or browse for an existing image.</li>
+                      <li><span className="step-num">2</span> Inspect file preview thumbnail.</li>
+                      <li><span className="step-num">3</span> Click <b>Run Analysis (Uploaded File)</b>.</li>
+                      <li><span className="step-num">4</span> Review taxonomic detection output.</li>
+                    </ul>
+                  )}
                 </div>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  <button className="btn-primary" style={{ justifyContent: 'center' }} onClick={handleCapture} disabled={isCapturing || connectionState.status === 'disconnected'}>
-                    <Camera size={16} /> {isCapturing ? "Capturing..." : "Capture Slide Frame"}
-                  </button>
-                  
-                  <button className="btn-secondary" style={{ display: 'flex', justifyContent: 'center', gap: '8px', background: capturedImage ? '#0f4c81' : '', color: capturedImage ? '#fff' : '' }} onClick={handleAnalyze} disabled={!capturedImage || isAnalyzing}>
-                    <Play size={16} /> {isAnalyzing ? "Analyzing (OpenVINO)..." : "Run Analysis"}
-                  </button>
+                  {analysisMode === 'camera' ? (
+                    <>
+                      <button 
+                        className="btn-primary" 
+                        style={{ justifyContent: 'center' }} 
+                        onClick={handleCapture} 
+                        disabled={isCapturing || connectionState.status === 'disconnected'}
+                      >
+                        <Camera size={16} /> {isCapturing ? "Capturing..." : "Capture Slide Frame"}
+                      </button>
+                      
+                      <button 
+                        className="btn-secondary" 
+                        style={{ 
+                          display: 'flex', 
+                          justifyContent: 'center', 
+                          gap: '8px', 
+                          background: capturedImage ? '#0f4c81' : '', 
+                          color: capturedImage ? '#fff' : '' 
+                        }} 
+                        onClick={handleAnalyze} 
+                        disabled={!capturedImage || isAnalyzing}
+                      >
+                        <Play size={16} /> {isAnalyzing ? "Analyzing (OpenVINO)..." : "Run Analysis"}
+                      </button>
 
-                  {capturedImage && (
-                    <button className="btn-secondary" style={{ border: 'none', background: 'none', color: '#64748b', justifyContent: 'center' }} onClick={() => setCapturedImage(null)}>
-                      <RefreshCw size={14} /> Clear Frame & Return to Live Feed
-                    </button>
+                      {capturedImage && (
+                        <button 
+                          className="btn-secondary" 
+                          style={{ border: 'none', background: 'none', color: '#64748b', justifyContent: 'center' }} 
+                          onClick={() => setCapturedImage(null)}
+                        >
+                          <RefreshCw size={14} /> Clear Frame & Return to Live Feed
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <button 
+                        className="btn-primary" 
+                        style={{ justifyContent: 'center' }} 
+                        onClick={handleAnalyze} 
+                        disabled={!uploadedImage || isAnalyzing}
+                      >
+                        <Play size={16} /> {isAnalyzing ? "Analyzing Image..." : "Run Analysis (Uploaded File)"}
+                      </button>
+
+                      {uploadedImage && (
+                        <button 
+                          className="btn-secondary" 
+                          style={{ border: 'none', background: 'none', color: '#64748b', justifyContent: 'center' }} 
+                          onClick={() => {
+                            setUploadedImage(null);
+                            if (fileInputRef.current) fileInputRef.current.value = '';
+                          }}
+                        >
+                          <RefreshCw size={14} /> Clear Uploaded Image
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
