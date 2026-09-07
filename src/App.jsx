@@ -3,20 +3,20 @@ import {
   Activity, Camera, Clock,
   LayoutDashboard, Menu, Play, Plus, ExternalLink,
   Download, RefreshCw, Eye, UploadCloud, Image as ImageIcon,
-  Thermometer
+  Thermometer, AlertCircle, WifiOff
 } from 'lucide-react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import './App.css';
 
 // Edge Device (Raspberry Pi 5) - Strictly used for Stream and Processing Trigger
-const PI_IP = '10.139.235.135'; 
+const PI_IP = '10.102.6.135'; 
 const PI_STREAM_URL = `http://${PI_IP}:5000/api/stream`;
 const PI_TRIGGER_URL = `http://${PI_IP}:5000/api/trigger`;
 const PI_CAPTURE_URL = `http://${PI_IP}:5000/api/capture`;
 
 // Cloud Attributes (Proxied through Vite to prevent CORS blocks)
-const CLOUD_ATTRIBUTES_URL = `/tb-api/attributes?clientKeys=latestAnalysis,analysisHistory,camera_connected,pi_temperature`;
+const CLOUD_ATTRIBUTES_URL = `/tb-api/attributes?clientKeys=latestAnalysis,analysisHistory,camera_connected,pi_temperature,last_edge_seen`;
 
 // Helper function to fetch remote Dropbox image and convert it into Base64 for jsPDF
 const getBase64FromUrl = async (url) => {
@@ -39,10 +39,13 @@ export default function App() {
   const [currentView, setCurrentView] = useState('dashboard');
   const [analysisMode, setAnalysisMode] = useState('camera'); // 'camera' | 'upload'
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  
+  // Real-time edge connectivity state
   const [connectionState, setConnectionState] = useState({
-    status: 'connected',
-    cameraConnected: true,
-    temperature: null
+    status: 'disconnected', // 'connected' | 'disconnected'
+    cameraConnected: false,
+    temperature: null,
+    lastEdgeSeen: null
   });
 
   const [capturedImage, setCapturedImage] = useState(null);
@@ -79,11 +82,16 @@ export default function App() {
         const data = await res.json();
         const clientAttrs = data.client || {};
 
-        if (clientAttrs.pi_temperature !== undefined) {
+        // Track last known hardware values
+        if (clientAttrs.last_edge_seen !== undefined) {
+          const timestamp = Number(clientAttrs.last_edge_seen);
+          const isAlive = (Date.now() - timestamp) < 15000; // Heartbeat valid within 15 seconds
+
           setConnectionState({
-            status: 'connected',
-            cameraConnected: clientAttrs.camera_connected ?? true,
-            temperature: typeof clientAttrs.pi_temperature === 'number' ? clientAttrs.pi_temperature : null
+            status: isAlive ? 'connected' : 'disconnected',
+            cameraConnected: isAlive ? (clientAttrs.camera_connected ?? false) : false,
+            temperature: isAlive && typeof clientAttrs.pi_temperature === 'number' ? clientAttrs.pi_temperature : null,
+            lastEdgeSeen: timestamp
           });
         }
 
@@ -95,7 +103,7 @@ export default function App() {
           setLatestResult(parsed);
         }
 
-        // Pull the permanent historical audit trail stored in the Cloud
+        // Pull permanent historical audit trail stored in Cloud
         if (clientAttrs.analysisHistory) {
           const parsedHistory = typeof clientAttrs.analysisHistory === 'string'
             ? JSON.parse(clientAttrs.analysisHistory)
@@ -107,29 +115,57 @@ export default function App() {
         }
       }
     } catch (e) {
-      console.warn("ThingsBoard telemetry polling notice:", e);
+      // Do not flip UI on transient carrier DNS or single-packet timeouts
+      console.warn("Transient ThingsBoard poll glitch:", e.message || e);
     }
   };
 
+  // Watchdog evaluates freshness every 3 seconds
   useEffect(() => {
     fetchThingsBoardCloudData();
-    const interval = setInterval(fetchThingsBoardCloudData, 3000);
-    return () => clearInterval(interval);
+    const interval = setInterval(fetchThingsBoardCloudData, 5000); // 5s cadence respects carrier limits
+
+    const watchdog = setInterval(() => {
+      setConnectionState(prev => {
+        if (prev.lastEdgeSeen && (Date.now() - prev.lastEdgeSeen >= 15000)) {
+          return {
+            ...prev,
+            status: 'disconnected',
+            cameraConnected: false,
+            temperature: null
+          };
+        }
+        return prev;
+      });
+    }, 3000);
+
+    return () => {
+      clearInterval(interval);
+      clearInterval(watchdog);
+    };
   }, []);
+
+  const isPiOnline = connectionState.status === 'connected';
 
   // --------------------------------------------------------------------------
   // 2. Capture Frame Snapshot (Direct from Pi)
   // --------------------------------------------------------------------------
   const handleCapture = async () => {
+    if (!isPiOnline) {
+      alert("Raspberry Pi is currently offline. Please power on the Pi.");
+      return;
+    }
     setIsCapturing(true);
     try {
       const res = await fetch(PI_CAPTURE_URL, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         setCapturedImage(data.image);
+      } else {
+        alert("Failed to capture slide frame from Raspberry Pi.");
       }
     } catch {
-      alert("Failed to capture slide frame from Raspberry Pi.");
+      alert("Cannot reach Raspberry Pi. Ensure it is connected to local network.");
     } finally {
       setIsCapturing(false);
     }
@@ -169,6 +205,10 @@ export default function App() {
   // 4. Trigger Analysis on Pi (Zero Local Storage -> Cloud Dispatched)
   // --------------------------------------------------------------------------
   const handleAnalyze = async () => {
+    if (!isPiOnline) {
+      alert("Raspberry Pi edge engine is offline. Power on the Pi to run AI inference.");
+      return;
+    }
     if (analysisMode === 'camera' && !capturedImage) {
       alert("Please capture a slide frame first.");
       return;
@@ -273,7 +313,7 @@ export default function App() {
 
     let currentY = doc.lastAutoTable.finalY + 8;
 
-    // Embed Actual Micrograph Image into the PDF
+    // Embed Actual Micrograph Image into PDF
     const imgUrl = latestResult.annotatedImageUrl || latestResult.rawImageUrl;
     if (imgUrl) {
       if (currentY > 190) {
@@ -319,7 +359,7 @@ export default function App() {
     doc.save(`MarineAI_Report_${latestResult.sampleId.replace(/\s+/g, '_')}.pdf`);
   };
 
-  const canRunAnalysis = analysisMode === 'camera' ? !!capturedImage : !!uploadedImage;
+  const canRunAnalysis = isPiOnline && (analysisMode === 'camera' ? !!capturedImage : !!uploadedImage);
 
   return (
     <div className="app-container">
@@ -336,7 +376,7 @@ export default function App() {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          {connectionState.temperature !== null && (
+          {isPiOnline && connectionState.temperature !== null && (
             <span className={`temp-badge ${
               connectionState.temperature > 75 ? 'hot' : (connectionState.temperature > 60 ? 'warm' : 'normal')
             }`}>
@@ -345,9 +385,16 @@ export default function App() {
             </span>
           )}
 
-          <span className="status-badge connected">
-            <span className="status-dot"></span>
-            Cloud Synced (ThingsBoard)
+          {/* DYNAMIC REAL-TIME CONNECTION BADGE */}
+          <span className={`status-badge ${isPiOnline ? 'connected' : 'disconnected'}`} style={{
+            background: isPiOnline ? '#ecfdf5' : '#fef2f2',
+            color: isPiOnline ? '#059669' : '#dc2626',
+            border: isPiOnline ? '1px solid #a7f3d0' : '1px solid #fecaca'
+          }}>
+            <span className="status-dot" style={{
+              background: isPiOnline ? '#10b981' : '#ef4444'
+            }}></span>
+            {isPiOnline ? "Pi Online (ThingsBoard Synced)" : "Edge Pi Offline"}
           </span>
         </div>
       </header>
@@ -455,25 +502,59 @@ export default function App() {
                   <span style={{ fontWeight: 600, fontSize: '14px' }}>
                     {analysisMode === 'camera' ? 'Optical Field View (Pi Stream)' : 'Local Micrograph File'}
                   </span>
-                  <span style={{ fontSize: '12px', fontWeight: 600, color: '#0f4c81' }}>
-                    • {analysisMode === 'camera' ? (capturedImage ? 'Frame Captured (Ready)' : 'Live IMX477 Optical Feed') : (uploadedImage ? 'File Staged (Ready)' : 'Awaiting File')}
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: isPiOnline ? '#0f4c81' : '#dc2626' }}>
+                    • {analysisMode === 'camera' 
+                        ? (isPiOnline 
+                            ? (capturedImage ? 'Frame Captured (Ready)' : 'Live IMX477 Optical Feed') 
+                            : 'Edge Device Offline') 
+                        : (uploadedImage ? 'File Staged (Ready)' : 'Awaiting File')}
                   </span>
                 </div>
                 
                 {analysisMode === 'camera' ? (
                   <div className="preview-box">
-                    {capturedImage ? (
-                      <div className="uploaded-preview-wrapper" style={{ width: '100%', height: '100%' }}>
-                        <img src={capturedImage} alt="Captured Slide" className="preview-overlay-image" />
-                        <button 
-                          className="dropzone-reset-btn"
-                          onClick={() => setCapturedImage(null)}
-                        >
-                          <RefreshCw size={14} /> Recapture Live Feed
-                        </button>
-                      </div>
+                    {isPiOnline ? (
+                      capturedImage ? (
+                        <div className="uploaded-preview-wrapper" style={{ width: '100%', height: '100%' }}>
+                          <img src={capturedImage} alt="Captured Slide" className="preview-overlay-image" />
+                          <button 
+                            className="dropzone-reset-btn"
+                            onClick={() => setCapturedImage(null)}
+                          >
+                            <RefreshCw size={14} /> Recapture Live Feed
+                          </button>
+                        </div>
+                      ) : (
+                        <img 
+                          src={PI_STREAM_URL} 
+                          alt="Live Camera Feed" 
+                          className="preview-overlay-image"
+                        />
+                      )
                     ) : (
-                      <img src={PI_STREAM_URL} alt="Live Camera Feed" className="preview-overlay-image" />
+                      /* OFFLINE CAMERA PLACEHOLDER */
+                      <div style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        height: '100%',
+                        background: '#0f172a',
+                        color: '#94a3b8',
+                        gap: '12px',
+                        padding: '24px',
+                        textAlign: 'center'
+                      }}>
+                        <WifiOff size={42} color="#ef4444" />
+                        <div>
+                          <div style={{ color: '#f8fafc', fontWeight: 700, fontSize: '15px' }}>
+                            Edge Camera Stream Offline
+                          </div>
+                          <div style={{ fontSize: '12px', marginTop: '4px', color: '#94a3b8' }}>
+                            Raspberry Pi is powered off or not reachable at <code>{PI_IP}</code>.
+                          </div>
+                        </div>
+                      </div>
                     )}
                   </div>
                 ) : (
@@ -530,7 +611,7 @@ export default function App() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '12px', fontSize: '12px', color: '#64748b' }}>
                   <span>
                     {analysisMode === 'camera' 
-                      ? "Sensor: Arducam IMX477 HQ (1080p @ 25 FPS)"
+                      ? "Sensor: Arducam IMX477 HQ (1080p @ 25 FPS)" 
                       : "Source: High-Resolution File Ingestion"}
                   </span>
                   <span>Magnification: 100× Industrial Objective</span>
@@ -566,9 +647,13 @@ export default function App() {
                     <>
                       <button 
                         className="btn-primary" 
-                        style={{ justifyContent: 'center' }} 
+                        style={{ 
+                          justifyContent: 'center',
+                          opacity: !isPiOnline ? 0.5 : 1,
+                          cursor: !isPiOnline ? 'not-allowed' : 'pointer'
+                        }} 
                         onClick={handleCapture} 
-                        disabled={isCapturing}
+                        disabled={isCapturing || !isPiOnline}
                       >
                         <Camera size={16} /> {isCapturing ? "Capturing..." : (capturedImage ? "Recapture Slide Frame" : "Capture Slide Frame")}
                       </button>
@@ -580,9 +665,9 @@ export default function App() {
                           justifyContent: 'center', 
                           gap: '8px', 
                           background: canRunAnalysis ? '#0f4c81' : '#f1f5f9', 
-                          color: canRunAnalysis ? '#fff' : '#94a3b8',
-                          cursor: canRunAnalysis ? 'pointer' : 'not-allowed',
-                          border: canRunAnalysis ? 'none' : '1px solid #e2e8f0'
+                          color: canRunAnalysis ? '#fff' : '#94a3b8', 
+                          cursor: canRunAnalysis ? 'pointer' : 'not-allowed', 
+                          border: canRunAnalysis ? 'none' : '1px solid #e2e8f0' 
                         }} 
                         onClick={handleAnalyze} 
                         disabled={!canRunAnalysis || isAnalyzing}
@@ -590,7 +675,13 @@ export default function App() {
                         <Play size={16} /> {isAnalyzing ? "Processing & Syncing to Cloud..." : "Run Analysis & Sync to Cloud"}
                       </button>
 
-                      {!capturedImage && (
+                      {!isPiOnline && (
+                        <div style={{ fontSize: '11px', color: '#dc2626', textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
+                          <AlertCircle size={12} /> Edge Pi is offline. Power on Pi to acquire slides.
+                        </div>
+                      )}
+
+                      {isPiOnline && !capturedImage && (
                         <div style={{ fontSize: '11px', color: '#94a3b8', textAlign: 'center' }}>
                           Capture a frame first to unlock AI analysis
                         </div>
@@ -602,12 +693,12 @@ export default function App() {
                         className={canRunAnalysis ? "btn-primary" : "btn-secondary"} 
                         style={{ 
                           justifyContent: 'center',
-                          display: 'flex',
-                          gap: '8px',
-                          background: canRunAnalysis ? '#0f4c81' : '#f1f5f9',
-                          color: canRunAnalysis ? '#fff' : '#94a3b8',
-                          cursor: canRunAnalysis ? 'pointer' : 'not-allowed',
-                          border: canRunAnalysis ? 'none' : '1px solid #e2e8f0'
+                          display: 'flex', 
+                          gap: '8px', 
+                          background: canRunAnalysis ? '#0f4c81' : '#f1f5f9', 
+                          color: canRunAnalysis ? '#fff' : '#94a3b8', 
+                          cursor: canRunAnalysis ? 'pointer' : 'not-allowed', 
+                          border: canRunAnalysis ? 'none' : '1px solid #e2e8f0' 
                         }} 
                         onClick={handleAnalyze} 
                         disabled={!canRunAnalysis || isAnalyzing}
